@@ -25,7 +25,7 @@
 //! They are intended solely for testing purposes.
 
 use crate::list::{PaginatedListOptions, PaginatedListStore};
-use crate::multipart::MultipartStore;
+use crate::multipart::{CompleteMultipartOptions, MultipartStore};
 use crate::path::Path;
 use crate::{
     Attribute, Attributes, DynObjectStore, Error, GetOptions, GetRange, MultipartUpload,
@@ -1078,6 +1078,58 @@ pub async fn put_multipart_opts_create(storage: &dyn ObjectStore, supported: boo
     let err = upload.complete().await.unwrap_err();
     assert!(matches!(err, Error::AlreadyExists { .. }), "{err}");
     upload.abort().await.unwrap();
+
+    let b = storage.get(&path).await.unwrap().bytes().await.unwrap();
+    assert_eq!(b.as_ref(), b"a");
+
+    storage.delete(&path).await.unwrap();
+}
+
+/// Tests [`MultipartStore::complete_multipart_opts`] with [`PutMode::Create`]
+///
+/// When `supported`, a second completion at the same path fails with
+/// [`Error::AlreadyExists`], leaves the first object in place, and leaves its own
+/// upload open to be aborted. Otherwise the completion is refused.
+pub async fn multipart_store_complete_create(
+    storage: &dyn ObjectStore,
+    multipart: &dyn MultipartStore,
+    supported: bool,
+) {
+    let path = Path::from("multipart_store_complete_create");
+    let _ = storage.delete(&path).await;
+    let opts = || CompleteMultipartOptions {
+        mode: PutMode::Create,
+        ..Default::default()
+    };
+
+    let id = multipart.create_multipart(&path).await.unwrap();
+    let part = multipart.put_part(&path, &id, 0, "a".into()).await.unwrap();
+    let result = multipart
+        .complete_multipart_opts(&path, &id, vec![part], opts())
+        .await;
+
+    if !supported {
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::NotImplemented { .. } | Error::NotSupported { .. }
+            ),
+            "{err}"
+        );
+        multipart.abort_multipart(&path, &id).await.unwrap();
+        return;
+    }
+    result.unwrap();
+
+    let id = multipart.create_multipart(&path).await.unwrap();
+    let part = multipart.put_part(&path, &id, 0, "b".into()).await.unwrap();
+    let err = multipart
+        .complete_multipart_opts(&path, &id, vec![part], opts())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::AlreadyExists { .. }), "{err}");
+    multipart.abort_multipart(&path, &id).await.unwrap();
 
     let b = storage.get(&path).await.unwrap().bytes().await.unwrap();
     assert_eq!(b.as_ref(), b"a");

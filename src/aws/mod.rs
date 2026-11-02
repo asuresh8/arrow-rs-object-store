@@ -43,7 +43,7 @@ use crate::aws::client::{CompleteMultipartMode, PutPartPayload, RequestError, S3
 use crate::client::CredentialProvider;
 use crate::client::get::GetClientExt;
 use crate::client::list::{ListClient, ListClientExt};
-use crate::multipart::{MultipartStore, PartId};
+use crate::multipart::{CompleteMultipartOptions, MultipartStore, PartId};
 use crate::retry::{MultipartRetry, RetryPolicy};
 use crate::signer::{SignedUrlOptions, Signer};
 use crate::util::{STRICT_ENCODE_SET, validate_signed_url_extras};
@@ -104,6 +104,25 @@ impl AmazonS3 {
     /// Create a full URL to the resource specified by `path` with this instance's configuration.
     fn path_url(&self, path: &Path) -> String {
         self.client.config.path_url(path)
+    }
+
+    /// The [`CompleteMultipartMode`] that implements `mode`, or the error `operation` returns
+    /// when this store can't apply it at completion.
+    fn complete_mode(&self, mode: &PutMode, operation: &str) -> Result<CompleteMultipartMode> {
+        match (mode, &self.client.config.conditional_put) {
+            (PutMode::Overwrite, _) => Ok(CompleteMultipartMode::Overwrite),
+            (PutMode::Create, S3ConditionalPut::ETagMatch) => Ok(CompleteMultipartMode::Create),
+            (PutMode::Create, S3ConditionalPut::Disabled) => Err(Error::NotImplemented {
+                operation: format!(
+                    "`{operation}` with mode `PutMode::Create` when conditional put is disabled"
+                ),
+                implementer: self.to_string(),
+            }),
+            (PutMode::Update(_), _) => Err(Error::NotImplemented {
+                operation: format!("`{operation}` with mode `PutMode::Update`"),
+                implementer: self.to_string(),
+            }),
+        }
     }
 }
 
@@ -304,22 +323,7 @@ impl ObjectStore for AmazonS3 {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
-        let complete_mode = match (&opts.mode, &self.client.config.conditional_put) {
-            (PutMode::Overwrite, _) => CompleteMultipartMode::Overwrite,
-            (PutMode::Create, S3ConditionalPut::ETagMatch) => CompleteMultipartMode::Create,
-            (PutMode::Create, S3ConditionalPut::Disabled) => {
-                return Err(Error::NotImplemented {
-                    operation: "`put_multipart_opts` with mode `PutMode::Create` when conditional put is disabled".into(),
-                    implementer: self.to_string(),
-                });
-            }
-            (PutMode::Update(_), _) => {
-                return Err(Error::NotImplemented {
-                    operation: "`put_multipart_opts` with mode `PutMode::Update`".into(),
-                    implementer: self.to_string(),
-                });
-            }
-        };
+        let complete_mode = self.complete_mode(&opts.mode, "put_multipart_opts")?;
         let retry_policy = opts.retry_policy();
         let upload_id = self.client.create_multipart(location, opts).await?;
 
@@ -747,6 +751,25 @@ impl MultipartStore for AmazonS3 {
         self.client
             .complete_multipart(path, id, parts, CompleteMultipartMode::Overwrite)
             .await
+    }
+
+    async fn complete_multipart_opts(
+        &self,
+        path: &Path,
+        id: &MultipartId,
+        parts: Vec<PartId>,
+        opts: CompleteMultipartOptions,
+    ) -> Result<PutResult> {
+        let CompleteMultipartOptions {
+            mode,
+            extensions: _,
+        } = opts;
+        let mode = self.complete_mode(&mode, "complete_multipart_opts")?;
+        let result = self.client.complete_multipart(path, id, parts, mode).await;
+        match mode {
+            CompleteMultipartMode::Create => map_create_error(path.to_string(), result),
+            CompleteMultipartMode::Overwrite => result,
+        }
     }
 
     async fn abort_multipart(&self, path: &Path, id: &MultipartId) -> Result<()> {
@@ -1623,6 +1646,7 @@ mod tests {
             put_opts(&integration, true).await;
         }
         put_multipart_opts_create(&integration, test_conditional_put).await;
+        multipart_store_complete_create(&integration, &integration, test_conditional_put).await;
 
         // run integration test with unsigned payload enabled
         let builder = AmazonS3Builder::from_env().with_unsigned_payload(true);

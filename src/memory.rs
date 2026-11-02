@@ -26,7 +26,7 @@ use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream::BoxStream};
 use parking_lot::RwLock;
 
-use crate::multipart::{MultipartStore, PartId};
+use crate::multipart::{CompleteMultipartOptions, MultipartStore, PartId};
 use crate::util::InvalidGetRange;
 use crate::{
     Attributes, GetRange, GetResult, GetResultPayload, ListResult, MultipartId, MultipartUpload,
@@ -477,9 +477,39 @@ impl MultipartStore for InMemory {
         &self,
         path: &Path,
         id: &MultipartId,
-        _parts: Vec<PartId>,
+        parts: Vec<PartId>,
     ) -> Result<PutResult> {
+        self.complete_multipart_opts(path, id, parts, CompleteMultipartOptions::default())
+            .await
+    }
+
+    async fn complete_multipart_opts(
+        &self,
+        path: &Path,
+        id: &MultipartId,
+        _parts: Vec<PartId>,
+        opts: CompleteMultipartOptions,
+    ) -> Result<PutResult> {
+        let CompleteMultipartOptions {
+            mode,
+            extensions: _,
+        } = opts;
+        if matches!(mode, PutMode::Update(_)) {
+            return Err(crate::Error::NotImplemented {
+                operation: "`complete_multipart_opts` with mode `PutMode::Update`".into(),
+                implementer: self.to_string(),
+            });
+        }
+
         let mut storage = self.storage.write();
+        // Checked under the same lock as the insert below. As on S3, a refused
+        // completion leaves the upload in place, so it can still be aborted.
+        if mode == PutMode::Create && storage.map.contains_key(path) {
+            return Err(Error::AlreadyExists {
+                path: path.to_string(),
+            }
+            .into());
+        }
         let upload = storage.remove_upload(id)?;
 
         let mut cap = 0;
@@ -633,6 +663,7 @@ mod tests {
         stream_get(&integration).await;
         put_opts(&integration, true).await;
         put_multipart_opts_create(&integration, true).await;
+        multipart_store_complete_create(&integration, &integration, true).await;
         multipart(&integration, &integration).await;
         multipart_with_opts(&integration, &integration).await;
         put_get_attributes(&integration).await;
